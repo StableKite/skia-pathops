@@ -13,6 +13,7 @@ from packaging.version import parse as parse_version
 import struct
 import subprocess
 import sys
+import sysconfig
 import os
 import platform
 from io import open
@@ -35,12 +36,15 @@ BUILD_SKIA_FROM_SOURCE = bool(int(os.environ.get("BUILD_SKIA_FROM_SOURCE", "1"))
 SKIA_LIBRARY_DIR = os.environ.get("SKIA_LIBRARY_DIR")
 
 # Python Limited API for stable ABI support is enabled by default.
-# PyPy does not support Limited API, so we disable it automatically.
+# PyPy and free-threaded CPython builds use their native extension ABI.
 # Can also be disabled manually with USE_PY_LIMITED_API=0.
 # https://docs.python.org/3/c-api/stable.html#limited-c-api
-is_pypy = sys.implementation.name == "pypy"
-use_py_limited_api = (
-    False if is_pypy else bool_from_environ("USE_PY_LIMITED_API", default=True)
+supports_py_limited_api = (
+    sys.implementation.name != "pypy"
+    and not sysconfig.get_config_var("Py_GIL_DISABLED")
+)
+use_py_limited_api = supports_py_limited_api and bool_from_environ(
+    "USE_PY_LIMITED_API", default=True
 )
 # NOTE: this must be kept in sync with python_requires='>=3.10' below
 limited_api_min_version = "0x030A0000"  # Python 3.10
@@ -75,7 +79,6 @@ if {"build", "build_ext", "bdist_wheel", "install", "develop", "test"}.intersect
 needs_wheel = {"bdist_wheel"}.intersection(argv)
 wheel = ["wheel"] if needs_wheel else []
 
-setuptools_git_ls_files = ["setuptools_git_ls_files"] if os.path.isdir(".git") else []
 
 
 class custom_build_ext(build_ext):
@@ -407,7 +410,7 @@ setup_params = dict(
         "build_ext": custom_build_ext,
     },
     options={"bdist_wheel": {"py_limited_api": "cp310"}} if use_py_limited_api else {},
-    setup_requires=["setuptools_scm", "packaging"] + setuptools_git_ls_files + wheel,
+    setup_requires=["setuptools_scm", "packaging"] + wheel,
     install_requires=[],
     extras_require={
         "testing": [

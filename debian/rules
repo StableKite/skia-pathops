@@ -1,7 +1,12 @@
 #!/usr/bin/make -f
 # -*- makefile -*-
 
+include /usr/share/dpkg/pkg-info.mk
+
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# A source checkout for a binary build can be shallow and lack the release tag.
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SKIA_PATHOPS = $(DEB_VERSION_UPSTREAM)
 
 # Use system libskia instead of building from source
 export BUILD_SKIA_FROM_SOURCE = 0
