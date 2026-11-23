@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Use system libskia instead of building from source
+export BUILD_SKIA_FROM_SOURCE = 0
+
+# libskia-dev installs headers to /usr/include/skia/ (no include/ prefix).
+# skia-pathops includes them as "include/core/Sk*.h", so we provide a shim
+# directory where include/ is a symlink to /usr/include/skia (created on-the-fly).
+export DEB_CPPFLAGS_MAINT_APPEND = -I$(CURDIR)/debian/skia-include-shim
+
+execute_before_dh_auto_configure:
+	ln -sf /usr/include/skia debian/skia-include-shim/include
+
+%:
+	dh $@ --buildsystem=pybuild
