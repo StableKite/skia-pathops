@@ -11,6 +11,7 @@ from ._skia.core cimport (
     SkScalar,
     SkSpan,
     SkPathDirection,
+    SkPaint,
     SkMatrix,
 )
 from ._skia.pathops cimport (
@@ -95,6 +96,8 @@ cdef bint collinear(
 cdef class Path:
 
     cdef SkPathBuilder path
+    cdef void _copy_from(self, Path other)
+    cdef void _stroke(self, SkPaint& paint)
 
     @staticmethod
     cdef Path create(const SkPathBuilder& path)

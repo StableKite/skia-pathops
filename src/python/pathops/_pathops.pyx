@@ -1,3 +1,4 @@
+# cython: freethreading_compatible=True
 from ._skia.core cimport (
     SkArcSize,
     SkPath,
@@ -39,6 +40,49 @@ from libc.math cimport fabs, sqrt, isfinite
 from libc.stddef cimport size_t
 from libc.string cimport memset
 cimport cython
+
+# SkPathBuilder and SkOpBuilder are mutable C++ objects. Serialize native
+# access, including operations with multiple input paths, on free-threaded Python.
+cdef extern from *:
+    """
+    #ifdef Py_GIL_DISABLED
+    #include <mutex>
+    #endif
+    namespace pathops {
+    class StateGuard {
+    public:
+        StateGuard() = default;
+        void acquire() {
+    #ifdef Py_GIL_DISABLED
+            if (!mutex.try_lock()) {
+                // A waiting thread must not prevent the holder from using Python.
+                Py_BEGIN_ALLOW_THREADS
+                mutex.lock();
+                Py_END_ALLOW_THREADS
+            }
+            locked = true;
+    #endif
+        }
+        ~StateGuard() {
+    #ifdef Py_GIL_DISABLED
+            if (locked)
+                mutex.unlock();
+    #endif
+        }
+        StateGuard(const StateGuard&) = delete;
+        StateGuard& operator=(const StateGuard&) = delete;
+    private:
+    #ifdef Py_GIL_DISABLED
+        inline static std::recursive_mutex mutex;
+        bool locked = false;
+    #endif
+    };
+    }
+    """
+    cdef cppclass StateGuard "pathops::StateGuard":
+        StateGuard()
+        void acquire()
+
 
 # Explicit declarations for Limited API / Stable ABI compatibility
 cdef extern from "Python.h":
@@ -179,14 +223,21 @@ cdef class Path:
         if other is not None:
             if isinstance(other, Path):
                 static_path = other
-                self.path = static_path.path
+                self._copy_from(static_path)
             else:
                 other.draw(self.getPen())
         if fillType is not None:
             self.fillType = fillType
 
+    cdef void _copy_from(self, Path other):
+        cdef StateGuard guard
+        guard.acquire()
+        self.path = other.path
+
     @staticmethod
     cdef Path create(const SkPathBuilder& path):
+        cdef StateGuard guard
+        guard.acquire()
         cdef Path self = Path.__new__(Path)
         self.path = path
         return self
@@ -198,6 +249,8 @@ cdef class Path:
         return RawPathIterator(self)
 
     def add(self, PathVerb verb, *pts):
+        cdef StateGuard guard
+        guard.acquire()
         if verb is PathVerb.MOVE:
             self.path.moveTo(pts[0][0], pts[0][1])
         elif verb is PathVerb.LINE:
@@ -218,9 +271,13 @@ cdef class Path:
             raise UnsupportedVerbError(verb)
 
     cpdef void moveTo(self, SkScalar x, SkScalar y):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.moveTo(x, y)
 
     cpdef void lineTo(self, SkScalar x, SkScalar y):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.lineTo(x, y)
 
     cpdef void quadTo(
@@ -230,6 +287,8 @@ cdef class Path:
         SkScalar x2,
         SkScalar y2
     ):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.quadTo(x1, y1, x2, y2)
 
     cpdef void conicTo(
@@ -240,6 +299,8 @@ cdef class Path:
         SkScalar y2,
         SkScalar w
     ):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.conicTo(x1, y2, x2, y2, w)
 
     cpdef void cubicTo(
@@ -251,6 +312,8 @@ cdef class Path:
         SkScalar x3,
         SkScalar y3,
     ):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.cubicTo(x1, y1, x2, y2, x3, y3)
 
     cpdef void arcTo(
@@ -263,6 +326,8 @@ cdef class Path:
         SkScalar x,
         SkScalar y,
     ):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.arcTo(
             SkPoint.Make(rx, ry),
             xAxisRotate,
@@ -273,13 +338,19 @@ cdef class Path:
 
 
     cpdef void close(self):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.close()
 
     cpdef void reset(self):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.reset()
 
     cpdef void rewind(self):
         """Deprecated alias for reset(). Use reset() instead."""
+        cdef StateGuard guard
+        guard.acquire()
         self.path.reset()
 
     cpdef draw(self, pen):
@@ -290,6 +361,8 @@ cdef class Path:
             getattr(pen, method)(*pts)
 
     def dump(self, cpp=False, as_hex=False):
+        cdef StateGuard guard
+        guard.acquire()
         # print a text repesentation to stdout
         if cpp:  # C++
             if as_hex:
@@ -301,14 +374,15 @@ cdef class Path:
 
     def _to_string(self, as_hex=False):
         # return a text repesentation as Python code
-        if self.path.isEmpty():
+        cdef Path snapshot = Path.create(self.path)
+        if snapshot.path.isEmpty():
             return ""
         if as_hex:
             coords_to_string = _format_hex_coords
         else:
             coords_to_string = lambda fs: (", ".join("%g" % f for f in fs))
-        s = ["path.fillType = %s" % self.fillType]
-        for verb, pts in self:
+        s = ["path.fillType = %s" % snapshot.fillType]
+        for verb, pts in snapshot:
             # if the last pt isn't a pt, such as for conic weight, peel it off
             suffix = ''
             if pts and not isinstance(pts[-1], tuple):
@@ -332,6 +406,8 @@ cdef class Path:
         return self.countContours()
 
     def __eq__(self, other):
+        cdef StateGuard guard
+        guard.acquire()
         if not isinstance(other, Path):
             return NotImplemented
         cdef Path static_other = other
@@ -343,26 +419,38 @@ cdef class Path:
     __hash__ = None  # Path is a mutable object, let's make it unhashable
 
     cpdef addPath(self, Path path):
+        cdef StateGuard guard
+        guard.acquire()
         self.path.addPath(path.path.snapshot())
 
     @property
     def fillType(self):
+        cdef StateGuard guard
+        guard.acquire()
         return FillType(<uint32_t>self.path.fillType())
 
     @fillType.setter
     def fillType(self, value):
+        cdef StateGuard guard
+        guard.acquire()
         cdef uint32_t fill = int(FillType(value))
         self.path.setFillType(<SkPathFillType>fill)
 
     @property
     def isConvex(self):
+        cdef StateGuard guard
+        guard.acquire()
         return self.path.snapshot().isConvex()
 
     def contains(self, tuple pt):
+        cdef StateGuard guard
+        guard.acquire()
         return self.path.contains(SkPoint.Make(pt[0], pt[1]))
 
     @property
     def bounds(self):
+        cdef StateGuard guard
+        guard.acquire()
         cdef optional[SkRect] bounds = self.path.computeTightBounds()
         if not bounds.has_value():
             return None
@@ -371,6 +459,8 @@ cdef class Path:
 
     @property
     def controlPointBounds(self):
+        cdef StateGuard guard
+        guard.acquire()
         cdef optional[SkRect] bounds = self.path.computeFiniteBounds()
         if not bounds.has_value():
             return None
@@ -379,18 +469,26 @@ cdef class Path:
 
     @property
     def area(self):
+        cdef StateGuard guard
+        guard.acquire()
         return fabs(get_path_area(self.path))
 
     @property
     def clockwise(self):
+        cdef StateGuard guard
+        guard.acquire()
         return get_path_area(self.path) < 0
 
     @clockwise.setter
     def clockwise(self, value):
+        cdef StateGuard guard
+        guard.acquire()
         if self.clockwise != value:
             self.reverse()
 
     cpdef reverse(self):
+        cdef StateGuard guard
+        guard.acquire()
         cdef Path contour
         cdef SkPathBuilder skpath
         skpath.setFillType(self.path.fillType())
@@ -405,6 +503,8 @@ cdef class Path:
         bint keep_starting_points=True,
         bint clockwise=False,
     ):
+        cdef StateGuard guard
+        guard.acquire()
         cdef list first_points
         if keep_starting_points:
             first_points = self.firstPoints
@@ -422,6 +522,8 @@ cdef class Path:
         return any(my_verb == verb for my_verb, _ in self)
 
     cpdef convertConicsToQuads(self, float tolerance=0.25):
+        cdef StateGuard guard
+        guard.acquire()
         # TODO is 0.25 too delicate? - blindly copies from Skias own use
         if not self._has(SkPathVerb.kConic):
             return
@@ -529,9 +631,16 @@ cdef class Path:
                 SkDashPathEffect.Make(<SkSpan[const SkScalar]>intervals.as_span(), dash_offset)
             )
 
+        self._stroke(paint)
+
+    cdef void _stroke(self, SkPaint& paint):
+        cdef StateGuard guard
+        guard.acquire()
         FillPathWithPaint(self.path.detach(), paint, &self.path)
 
     cdef list getVerbs(self):
+        cdef StateGuard guard
+        guard.acquire()
         return [PathVerb(verb) for verb in self.path.verbs()]
 
     @property
@@ -539,6 +648,8 @@ cdef class Path:
         return self.getVerbs()
 
     cdef list getPoints(self):
+        cdef StateGuard guard
+        guard.acquire()
         return [(pt.x(), pt.y()) for pt in self.path.points()]
 
     @property
@@ -546,6 +657,8 @@ cdef class Path:
         return self.getPoints()
 
     cdef int countContours(self) except -1:
+        cdef StateGuard guard
+        guard.acquire()
         if self.path.isEmpty():
             return 0
         cdef int n = 0
@@ -567,6 +680,8 @@ cdef class Path:
         return result
 
     cdef int getFirstPoints(self, SkPoint **pp, int *count) except -1:
+        cdef StateGuard guard
+        guard.acquire()
         cdef int c = self.path.verbs().size()
         if c == 0:
             return 0  # empty
@@ -597,14 +712,16 @@ cdef class Path:
 
     @property
     def contours(self):
+        # Iteration yields to the caller; keep its native storage independent.
+        cdef Path snapshot = Path.create(self.path)
         cdef SkPathBuilder temp
-        cdef SkPathFillType fillType = self.path.fillType()
+        cdef SkPathFillType fillType = snapshot.path.fillType()
 
         temp.setFillType(fillType)
 
         cdef SkPathVerb verb
         cdef SkSpan[const SkPoint] p
-        cdef optional[SkPathIter] iterator = self.path.iter()
+        cdef optional[SkPathIter] iterator = snapshot.path.iter()
         cdef optional[SkPathIter.Rec] rec
 
         while True:
@@ -765,13 +882,15 @@ cdef tuple NO_POINTS = ()
 cdef class RawPathIterator:
 
     def __cinit__(self, Path path):
-        self.path = path
+        self.path = Path.create(path.path)
         self.iterator = self.path.path.iter()
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        cdef StateGuard guard
+        guard.acquire()
         cdef tuple pts
         cdef SkPathVerb verb
         cdef SkSpan[const SkPoint] p
@@ -823,6 +942,8 @@ cdef class SegmentPenIterator:
         return self
 
     def __next__(self):
+        cdef StateGuard guard
+        guard.acquire()
         cdef tuple points
         cdef SkPathVerb verb
 
@@ -1212,6 +1333,8 @@ cdef int path_is_inside(const SkPathBuilder& self, const SkPathBuilder& other) e
 @cython.wraparound(False)
 @cython.boundscheck(False)
 cpdef int restore_starting_points(Path path, list points) except -1:
+    cdef StateGuard guard
+    guard.acquire()
     if not points:
         return 0
 
@@ -1255,6 +1378,8 @@ cpdef bint winding_from_even_odd(Path path, bint clockwise=False) except False:
     The outermost contours are set to counter-clockwise direction, unless
     'clockwise' is True.
     """
+    cdef StateGuard guard
+    guard.acquire()
     # TODO re-enable this once the new feature is stabilized in upstream skia
     # https://github.com/fonttools/skia-pathops/issues/10
     # if AsWinding(path.path, &path.path):
@@ -1542,6 +1667,8 @@ cpdef Path op(
     bint keep_starting_points=True,
     bint clockwise=False,
 ):
+    cdef StateGuard guard
+    guard.acquire()
     cdef list first_points
     if keep_starting_points:
         first_points = one.firstPoints + two.firstPoints
@@ -1563,6 +1690,8 @@ cpdef Path simplify(
     bint keep_starting_points=True,
     bint clockwise=False,
 ):
+    cdef StateGuard guard
+    guard.acquire()
     cdef list first_points
     if keep_starting_points:
         first_points = path.firstPoints
@@ -1586,17 +1715,23 @@ cdef class OpBuilder:
         bint keep_starting_points=True,
         bint clockwise=False,
     ):
+        cdef StateGuard guard
+        guard.acquire()
         self.fix_winding = fix_winding
         self.keep_starting_points = keep_starting_points
         self.first_points = []
         self.clockwise = clockwise
 
     cpdef add(self, Path path, SkPathOp operator):
+        cdef StateGuard guard
+        guard.acquire()
         self.builder.add(path.path.snapshot(), operator)
         if self.keep_starting_points:
             self.first_points.extend(path.firstPoints)
 
     cpdef Path resolve(self):
+        cdef StateGuard guard
+        guard.acquire()
         cdef optional[SkPath] skresult = self.builder.resolve()
         if not skresult.has_value():
             raise PathOpsError("operation did not succeed")
